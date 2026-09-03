@@ -38,29 +38,39 @@ except Exception as e:
 # 2. 전처리 핵심 함수 모듈
 # ---------------------------------------------------------
 
-def make_vendor_load(df):
-    """발주 등록 시점 기준 업체별 미입고 부하량 산출"""
-    c_dates = df['CrtDate'].to_numpy(dtype='datetime64[D]')
-    d_dates = df['DueDate'].to_numpy(dtype='datetime64[D]')
-    vnds = df['Vndnr'].astype(str).to_numpy()
-    qtys = df['OrdQty'].fillna(0).to_numpy(dtype=float)
-
+def make_vendor_load(df, group_col='Vndnr'):
     n = len(df)
-    load_cnt = np.zeros(n, dtype=float)
-    load_qty = np.zeros(n, dtype=float)
+    load_cnt = np.zeros(n)
+    load_qty = np.zeros(n)
 
-    for i in range(n):
-        c_i = c_dates[i]
-        v_i = vnds[i]
-        cond = (c_dates < c_i) & (d_dates >= c_i) & (vnds == v_i)
-        load_cnt[i] = cond.sum()
-        load_qty[i] = qtys[cond].sum()
+    qty = df['OrdQty'].fillna(0).to_numpy(dtype=float)
 
-    out = pd.DataFrame(index=df.index)
-    out['VndOpenCnt'] = load_cnt
-    out['VndOpenQty'] = load_qty
-    out['VndLoadRatio'] = load_qty / (qtys + 1e-5)
-    return out
+    for _, idx in df.groupby(group_col).groups.items():
+        pos = np.asarray(idx)                      # df는 RangeIndex라 위치와 동일
+        t   = df['CrtDate'].to_numpy()[pos]        # 각 건의 발주 시점
+
+        # 발주(열림) 쪽 누적
+        crt = df['CrtDate'].to_numpy()[pos]
+        o   = np.argsort(crt)
+        crt_s = crt[o]
+        qc  = np.concatenate([[0], np.cumsum(qty[pos][o])])
+
+        opened_cnt = np.searchsorted(crt_s, t, side='right')
+        opened_qty = qc[opened_cnt]
+
+        # 입고(닫힘) 쪽 누적
+        trn = df['TrnDate'].to_numpy()[pos]
+        o2  = np.argsort(trn)
+        trn_s = trn[o2]
+        qc2 = np.concatenate([[0], np.cumsum(qty[pos][o2])])
+
+        closed_cnt = np.searchsorted(trn_s, t, side='right')
+        closed_qty = qc2[closed_cnt]
+
+        load_cnt[pos] = opened_cnt - closed_cnt
+        load_qty[pos] = opened_qty - closed_qty
+
+        return load_cnt, load_qty
 
 def pipeline_preprocess(raw_df, history_df=None):
     df = raw_df.copy()
@@ -180,46 +190,13 @@ def make_past_stats(df, group_col, prefix):
             make_past_stats(df, gcol, pre)
         ], axis=1)
 
-    def make_vendor_load(df, group_col='Vndnr'):
-    n = len(df)
-    load_cnt = np.zeros(n)
-    load_qty = np.zeros(n)
-
-    qty = df['OrdQty'].fillna(0).to_numpy(dtype=float)
-
-    for _, idx in df.groupby(group_col).groups.items():
-        pos = np.asarray(idx)                      # df는 RangeIndex라 위치와 동일
-        t   = df['CrtDate'].to_numpy()[pos]        # 각 건의 발주 시점
-
-        # 발주(열림) 쪽 누적
-        crt = df['CrtDate'].to_numpy()[pos]
-        o   = np.argsort(crt)
-        crt_s = crt[o]
-        qc  = np.concatenate([[0], np.cumsum(qty[pos][o])])
-
-        opened_cnt = np.searchsorted(crt_s, t, side='right')
-        opened_qty = qc[opened_cnt]
-
-        # 입고(닫힘) 쪽 누적
-        trn = df['TrnDate'].to_numpy()[pos]
-        o2  = np.argsort(trn)
-        trn_s = trn[o2]
-        qc2 = np.concatenate([[0], np.cumsum(qty[pos][o2])])
-
-        closed_cnt = np.searchsorted(trn_s, t, side='right')
-        closed_qty = qc2[closed_cnt]
-
-        load_cnt[pos] = opened_cnt - closed_cnt
-        load_qty[pos] = opened_qty - closed_qty
-
-    return load_cnt, load_qty
 
 
-    df['VndOpenCnt'], df['VndOpenQty'] = make_vendor_load(df)
+df['VndOpenCnt'], df['VndOpenQty'] = make_vendor_load(df)
 
-    # 업체 규모 차이를 보정 — 절대 건수보다 '평소 대비 얼마나 밀려 있나'가 신호에 가깝다
-    vnd_mean_load = df.groupby('Vndnr')['VndOpenCnt'].transform('mean')
-    df['VndLoadRatio'] = df['VndOpenCnt'] / vnd_mean_load.replace(0, np.nan)
+# 업체 규모 차이를 보정 — 절대 건수보다 '평소 대비 얼마나 밀려 있나'가 신호에 가깝다
+vnd_mean_load = df.groupby('Vndnr')['VndOpenCnt'].transform('mean')
+df['VndLoadRatio'] = df['VndOpenCnt'] / vnd_mean_load.replace(0, np.nan)
 
     CUTOFF = pd.Timestamp('2026-01-01')     # ← 셀 3의 'safe_cutoff' 결과를 보고 필요시 앞당길 것
 
