@@ -1,45 +1,44 @@
 
 import io
 import joblib
-import keras
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="배송 지연 예측 시스템", layout="wide")
-st.title("🚚 배송 지연 예측 대시보드")
+st.set_page_config(page_title="발주 데이터 전처리 시스템", layout="wide")
+st.title("🛠️ 발주 데이터 전처리 파이프라인")
 
 # ---------------------------------------------------------
-# 1. 모델 및 메타 정보 로드
+# 1. 메타 데이터 로드 (과거 이력 및 기준값)
 # ---------------------------------------------------------
 @st.cache_resource
-def load_assets():
-    clf_model = keras.models.load_model("delivery_clf_0.9.keras")
-    reg_model = keras.models.load_model("delivery_reg_0.9.keras")
-    meta = joblib.load("delivery_meta_0.9.joblib")
-    return clf_model, reg_model, meta
+def load_meta():
+    try:
+        meta = joblib.load("delivery_meta_0.9.joblib")
+        return meta
+    except Exception as e:
+        return None
 
-try:
-    clf, reg, meta = load_assets()
-    scaler = meta["scaler"]
-    features = meta["features"]
-
-    # 보내주신 전처리 로직용 하이퍼파라미터
+meta = load_meta()
+if meta:
     RECENT_N = meta.get("RECENT_N", 5)
     EWM_HALFLIFE = meta.get("EWM_HALFLIFE", 3.0)
     fill_values = meta.get("fill_values", {})
-    df_history = meta.get("df_history", None) # 과거 이력 참조 DB
-except Exception as e:
-    st.error(f"모델 및 자원 로드 오류: {e}")
-    st.stop()
+    df_history = meta.get("df_history", None)
+else:
+    # 메타 파일이 없을 경우 기본 파라미터 적용
+    RECENT_N = 5
+    EWM_HALFLIFE = 3.0
+    fill_values = {}
+    df_history = None
+    st.info("💡 메타 파일(delivery_meta_0.9.joblib) 없이 기본 전처리 규칙으로 동작합니다.")
 
 
 # ---------------------------------------------------------
-# 2. 보내주신 전처리 함수 모듈화 (전처리 로직 원본 반영)
+# 2. 전처리 핵심 로직 함수
 # ---------------------------------------------------------
 def make_past_stats(target_df, history_df, group_col, prefix, recent_n=5, ewm_halflife=3.0):
     """과거 입고 실적 기반 누적 통계 피처 생성 (merge_asof 기반)"""
-    # 과거 이력과 신규 데이터를 합쳐서 시점 기준 정렬
     combined = pd.concat([history_df, target_df], axis=0, ignore_index=True)
 
     ev = combined[[group_col, 'TrnDate', 'DelayDays', 'IsDelay']].dropna(subset=['TrnDate']).sort_values('TrnDate').copy()
@@ -91,31 +90,32 @@ def make_vendor_load(df):
     out['VndOpenQty'] = load_qty
     out['VndLoadRatio'] = load_qty / (qtys + 1e-5)
     return out
+
 def pipeline_preprocess(raw_df, history_df=None):
-    """사용자가 업로드한 Raw Data 전처리 파이프라인"""
+    """Raw 엑셀 데이터의 1행을 컬럼명으로 지정 후 전처리 파이프라인 수행"""
     df = raw_df.copy()
 
     # 1) 컬럼명 먼저 지정 (1번째 행의 값을 헤더로 승격)
     df.columns = df.iloc[0].values
     df = df[1:].reset_index(drop=True)
 
-    # 2) 필요 시 앞쪽 6개 무의미한 컬럼 제거 (7번째 컬럼부터 사용)
+    # 2) 7번째 컬럼부터 데이터 슬라이싱 (필요에 따라 주석 제어)
     if len(df.columns) >= 7:
         df = df[df.columns[6:]].copy()
 
-    # 3) 날짜 컬럼 파싱 및 수치형 변환
+    # 3) 날짜 및 수치형 컬럼 변환
     for c in ['CrtDate', 'DueDate']:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c].astype(str), format='%Y%m%d', errors='coerce')
 
-    # 날짜 결측치 제거
+    # 필수 날짜 결측치 제거
     df = df.dropna(subset=['CrtDate', 'DueDate']).copy()
 
     for c in ['OrdQty', 'PurLt', 'OrdLt']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # 4) 날짜 기반 기본 파생변수 생성
+    # 4) 날짜 기반 기본 파생변수
     df['Due_Crt_diff'] = (df['DueDate'] - df['CrtDate']).dt.days
     df['Lt_Gap'] = df['Due_Crt_diff'] - df['PurLt']
     df['Due_Week'] = df['DueDate'].dt.isocalendar().week.astype(int)
@@ -127,18 +127,18 @@ def pipeline_preprocess(raw_df, history_df=None):
     df['Due_Dow_sin'] = np.sin(2 * np.pi * w / 7)
     df['Due_Dow_cos'] = np.cos(2 * np.pi * w / 7)
 
-    # 5) 업체 부하량 피처 산출
+    # 5) 업체 부하량 피처 생성
     load_df = make_vendor_load(df)
     df = pd.concat([df, load_df], axis=1)
 
-    # 6) 과거 입고 실적 기반 파생변수 생성 (history_df 존재 시)
+    # 6) 과거 입고 실적 기반 통계 생성 (history_df 존재 시)
     if history_df is not None and not history_df.empty:
         for gcol, pre in [('Vndnr', 'Vnd'), ('Itnbr', 'Item'), ('ITCLS', 'Cls')]:
             if gcol in df.columns and gcol in history_df.columns:
                 stats = make_past_stats(df, history_df, gcol, pre, RECENT_N, EWM_HALFLIFE)
                 df = pd.concat([df, stats], axis=1)
 
-    # 7) 결측치 채우기 (fill_values 활용)
+    # 7) 과거 통계 결측치 채우기
     for pre in ['Vnd', 'Item', 'Cls']:
         for suf in ['_MeanDelay', '_DelayRate', '_Recent', '_Ewm']:
             col_name = pre + suf
@@ -147,56 +147,45 @@ def pipeline_preprocess(raw_df, history_df=None):
 
     return df
 
+
 # ---------------------------------------------------------
 # 3. Streamlit 화면 구성
 # ---------------------------------------------------------
-uploaded_file = st.file_uploader("발주 Raw Data 엑셀 파일을 업로드하세요", type=["xlsx", "xls"])
+uploaded_file = st.file_uploader("전처리할 엑셀 파일(Raw Data)을 업로드하세요", type=["xlsx", "xls"])
 
 if uploaded_file is not None:
-    raw_df = pd.read_excel(uploaded_file)
-    st.subheader("📄 업로드 원본 데이터")
+    # 엑셀 로드 (헤더 없이 업로드)
+    raw_df = pd.read_excel(uploaded_file, header=None)
+
+    st.subheader("1. 업로드 원본 데이터 (1행 컬럼 변환 전)")
     st.dataframe(raw_df.head(), use_container_width=True)
 
-    if st.button("🚀 전처리 및 예측 실행"):
-        with st.spinner("보내주신 전처리 파이프라인 수행 중..."):
+    if st.button("⚙️ 전처리 실행"):
+        with st.spinner("데이터 전처리 변환 진행 중..."):
             try:
-                # 전처리 적용
+                # 전처리 수행
                 processed_df = pipeline_preprocess(raw_df, df_history)
 
-                # 학습 모델 피처 추출 및 스케일링
-                X = processed_df[features].fillna(0.0).astype(float)
-                X_scaled = scaler.transform(X)
+                st.success("✅ 전처리가 성공적으로 완료되었습니다!")
 
-                # 예측
-                p_delay = clf.predict(X_scaled).flatten()
-                reg_output = reg.predict(X_scaled).flatten()
+                # 데이터 정보 요약
+                st.markdown(f"**총 행 수:** `{len(processed_df)}` 개 / **총 컬럼 수:** `{len(processed_df.columns)}` 개")
 
-                # 지연 일수 복원 계산
-                pred_delay_days = p_delay * np.expm1(reg_output)
+                # 전처리 완료 데이터 표 출력
+                st.subheader("2. 전처리 완료 데이터 표")
+                st.dataframe(processed_df, use_container_width=True)
 
-                # 결과 수집
-                result_df = processed_df.copy()
-                result_df["지연 여부 예측"] = np.where(p_delay >= 0.5, "지연 위험", "정상")
-                result_df["예측 지연 일수"] = np.round(pred_delay_days, 2)
-
-                st.success("전처리 및 예측이 성공적으로 completed 되었습니다!")
-                st.subheader("📊 예측 결과 보기")
-
-                # 핵심 컬럼 요약 출력
-                display_cols = [c for c in ['Vndnr', 'Itnbr', 'CrtDate', 'DueDate', '지연 여부 예측', '예측 지연 일수'] if c in result_df.columns]
-                st.dataframe(result_df[display_cols], use_container_width=True)
-
-                # 엑셀 다운로드 기능
+                # 전처리 데이터 다운로드 버튼
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                    result_df.to_excel(writer, index=False, sheet_name="예측결과")
+                    processed_df.to_excel(writer, index=False, sheet_name="전처리데이터")
 
                 st.download_button(
-                    label="📥 전체 결과 다운로드 (엑셀)",
+                    label="📥 전처리 완료 데이터 엑셀 다운로드",
                     data=buffer.getvalue(),
-                    file_name="delivery_predictions.xlsx",
+                    file_name="processed_delivery_data.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
             except Exception as e:
-                st.error(f"전처리 및 예측 도중 오류 발생: {e}")
+                st.error(f"전처리 과정에서 오류가 발생했습니다: {e}")
