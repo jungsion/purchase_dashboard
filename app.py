@@ -92,7 +92,7 @@ def make_vendor_load(df):
     return out
 
 def pipeline_preprocess(raw_df, history_df=None):
-    df = pd.read_excel("납기일_Train_Data.xlsx", sheet_name='납기데이터', skiprows=1)
+    df = raw_df.copy()
     df.columns = df.iloc[0]
     df = df[1:].reset_index(drop=True)
     data_cols = df.columns[0:]
