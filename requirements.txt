@@ -4,3 +4,4 @@ openpyxl
 numpy
 tensorflow
 joblib
+scikit-learn
