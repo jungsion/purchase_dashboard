@@ -37,35 +37,6 @@ except Exception as e:
 # ---------------------------------------------------------
 # 2. 전처리 핵심 함수 모듈
 # ---------------------------------------------------------
-def make_past_stats(target_df, history_df, group_col, prefix, recent_n=5, ewm_halflife=3.0):
-    """과거 입고 실적 기반 누적 통계 피처 생성 (merge_asof 기반)"""
-    combined = pd.concat([history_df, target_df], axis=0, ignore_index=True)
-
-    ev = combined[[group_col, 'TrnDate', 'DelayDays', 'IsDelay']].dropna(subset=['TrnDate']).sort_values('TrnDate').copy()
-    g = ev.groupby(group_col)['DelayDays']
-
-    ev['cnt'] = ev.groupby(group_col).cumcount() + 1
-    ev['sum'] = g.cumsum()
-    ev['dsum'] = ev.groupby(group_col)['IsDelay'].cumsum()
-    ev['recent'] = g.transform(lambda s: s.rolling(recent_n, min_periods=1).mean())
-    ev['ewm'] = g.transform(lambda s: s.ewm(halflife=ewm_halflife).mean())
-
-    ev = ev.rename(columns={'TrnDate': 'd'})[[group_col, 'd', 'cnt', 'sum', 'dsum', 'recent', 'ewm']].sort_values('d')
-
-    left = target_df[[group_col, 'CrtDate']].rename(columns={'CrtDate': 'd'}).sort_values('d')
-    left['_i'] = left.index
-
-    m_df = pd.merge_asof(
-        left, ev, on='d', by=group_col, direction='backward', allow_exact_matches=False
-    ).set_index('_i').sort_index()
-
-    out = pd.DataFrame(index=target_df.index)
-    out[prefix + '_Cnt'] = m_df['cnt'].fillna(0).values
-    out[prefix + '_MeanDelay'] = (m_df['sum'] / m_df['cnt']).values
-    out[prefix + '_DelayRate'] = (m_df['dsum'] / m_df['cnt']).values
-    out[prefix + '_Recent'] = m_df['recent'].values
-    out[prefix + '_Ewm'] = m_df['ewm'].values
-    return out
 
 def make_vendor_load(df):
     """발주 등록 시점 기준 업체별 미입고 부하량 산출"""
@@ -98,26 +69,42 @@ def pipeline_preprocess(raw_df, history_df=None):
     data_cols = df.columns[0:]
     df = df[data_cols].copy()
 
-    last_trn = df['TrnDate'].max()
-    print(f"데이터 내 마지막 입고일: {last_trn.date()}\n")
+    date_cols = ['CrtDate', 'DueDate', 'AbleDate', 'TrnDate']
 
-    yearly = df.assign(Year=df['DueDate'].dt.year).groupby('Year').agg(
-        건수      = ('DelayDays', 'size'),
-        지연률    = ('IsDelay',   lambda s: round(s.mean()*100, 1)),
-        평균지연일 = ('DelayDays', lambda s: round(s.mean(), 2)),
-        지연건평균 = ('DelayDays', lambda s: round(s[s > 0].mean(), 2) if (s > 0).any() else 0),
-        최대지연일 = ('DelayDays', 'max'),
-    )
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col].astype(str), format='%Y%m%d', errors='coerce')
 
-    # 미입고 건이 어느 연도 납기에 몰려 있는지
-    # — 검증구간에서 빠진 '지연 후보'의 규모
-    if len(open_orders):
-        oo = open_orders.assign(Year=open_orders['DueDate'].dt.year)
-        oo = oo[oo['DueDate'] <= last_trn]
+    df = df.dropna(subset=['CrtDate', 'DueDate'])
 
-    # 판단 가이드 출력
-    p95_delay = df.loc[df['IsDelay'] == 1, 'DelayDays'].quantile(0.95)
-    safe_cutoff = last_trn - pd.Timedelta(days=float(p95_delay))
+    # [ver0.9 신규] TrnDate가 없는 건 = '아직 입고되지 않은 건'.
+    # 이 건들은 학습에 못 쓰지만, 검증구간이 얼마나 왜곡됐는지 판단하는 근거가 된다(셀 3).
+    open_orders = df[df['TrnDate'].isna()].copy()
+
+    df = df.dropna(subset=['TrnDate'])
+
+    # [ver0.8 동일] 동일 오더·품번·납기의 분할 납품 → 최종 입고일로 통합
+    key_cols = ['Ordno', 'Itnbr', 'DueDate']
+
+    agg_map = {c: 'first' for c in df.columns if c not in key_cols + ['TrnDate']}
+    agg_map['TrnDate'] = 'max'
+
+    df = df.groupby(key_cols, as_index=False).agg(agg_map)
+
+    # [ver0.8 동일] 타겟: 지연일 (조기·정시는 0, raw 기준 ±150일 벗어나는 극단값 제거)
+    df['DelayRaw'] = (df['TrnDate'] - df['DueDate']).dt.days
+    df = df[df['DelayRaw'].between(-150, 150)].copy()
+    df['DelayDays'] = df['DelayRaw'].clip(lower=0)
+    df['IsDelay']   = (df['DelayDays'] > 0).astype(int)
+
+    # [ver0.8 동일] 누수 피처 제거 — AbleDate(실제 입고일과 82% 일치), 변경 누적 횟수
+    df = df.drop(columns=['AbleDate', 'DelayRaw'])
+    df = df.drop(columns=['VndChgCnt', 'HwaChgCnt', 'OnTimeCnt', 'DelayCnt'], errors='ignore')
+
+    # [ver0.8 동일] 수치형 변환은 피처 생성 전에 한 번에
+    for c in ['OrdQty', 'PurLt', 'OrdLt']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    df = df.sort_values('CrtDate').reset_index(drop=True)
 
 
 RECENT_N = 10          # 최근 몇 건을 볼 것인가
@@ -194,38 +181,38 @@ def make_past_stats(df, group_col, prefix):
         ], axis=1)
 
     def make_vendor_load(df, group_col='Vndnr'):
-        n = len(df)
-        load_cnt = np.zeros(n)
-        load_qty = np.zeros(n)
+    n = len(df)
+    load_cnt = np.zeros(n)
+    load_qty = np.zeros(n)
 
-        qty = df['OrdQty'].fillna(0).to_numpy(dtype=float)
+    qty = df['OrdQty'].fillna(0).to_numpy(dtype=float)
 
-        for _, idx in df.groupby(group_col).groups.items():
-            pos = np.asarray(idx)                      # df는 RangeIndex라 위치와 동일
-            t   = df['CrtDate'].to_numpy()[pos]        # 각 건의 발주 시점
+    for _, idx in df.groupby(group_col).groups.items():
+        pos = np.asarray(idx)                      # df는 RangeIndex라 위치와 동일
+        t   = df['CrtDate'].to_numpy()[pos]        # 각 건의 발주 시점
 
-            # 발주(열림) 쪽 누적
-            crt = df['CrtDate'].to_numpy()[pos]
-            o   = np.argsort(crt)
-            crt_s = crt[o]
-            qc  = np.concatenate([[0], np.cumsum(qty[pos][o])])
+        # 발주(열림) 쪽 누적
+        crt = df['CrtDate'].to_numpy()[pos]
+        o   = np.argsort(crt)
+        crt_s = crt[o]
+        qc  = np.concatenate([[0], np.cumsum(qty[pos][o])])
 
-            opened_cnt = np.searchsorted(crt_s, t, side='right')
-            opened_qty = qc[opened_cnt]
+        opened_cnt = np.searchsorted(crt_s, t, side='right')
+        opened_qty = qc[opened_cnt]
 
-            # 입고(닫힘) 쪽 누적
-            trn = df['TrnDate'].to_numpy()[pos]
-            o2  = np.argsort(trn)
-            trn_s = trn[o2]
-            qc2 = np.concatenate([[0], np.cumsum(qty[pos][o2])])
+        # 입고(닫힘) 쪽 누적
+        trn = df['TrnDate'].to_numpy()[pos]
+        o2  = np.argsort(trn)
+        trn_s = trn[o2]
+        qc2 = np.concatenate([[0], np.cumsum(qty[pos][o2])])
 
-            closed_cnt = np.searchsorted(trn_s, t, side='right')
-            closed_qty = qc2[closed_cnt]
+        closed_cnt = np.searchsorted(trn_s, t, side='right')
+        closed_qty = qc2[closed_cnt]
 
-            load_cnt[pos] = opened_cnt - closed_cnt
-            load_qty[pos] = opened_qty - closed_qty
+        load_cnt[pos] = opened_cnt - closed_cnt
+        load_qty[pos] = opened_qty - closed_qty
 
-        return load_cnt, load_qty
+    return load_cnt, load_qty
 
 
     df['VndOpenCnt'], df['VndOpenQty'] = make_vendor_load(df)
@@ -274,10 +261,6 @@ def make_past_stats(df, group_col, prefix):
 
     df['VndLoadRatio'] = df['VndLoadRatio'].fillna(1.0)
 
-    d = df.dropna(subset=FEATURES + ['DelayDays']).copy()
-
-    for c in CAT_FEATURES:
-        d[c] = d[c].astype(str).astype('category')
 
     return df
 
